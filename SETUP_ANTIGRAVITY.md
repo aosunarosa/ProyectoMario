@@ -7,10 +7,26 @@ Este documento es para que el **Antigravity de tu colega** tome el control del p
 2. **Instalar dependencias**:
    - `cd backend && npm install`
    - `cd ../frontend && npm install`
-3. **Configurar .env**: Copiar `.env.example` (si existe) o crear uno en `backend/.env` con:
-   - `PRIVATE_KEY` (Wallet de Solana)
-   - `HELIUS_API_KEY`
-   - `RPC_URL` (Mainnet)
+3. **Configurar .env**: Crear un archivo en `backend/.env` con este contenido obligatorio:
+   ```env
+   PORT=3001
+   HELIUS_API_KEY=tu_clave_de_helius_aqui
+   SOLANA_PRIVATE_KEY=tu_clave_privada_aqui
+   ```
+
+## 2. Rutina Diaria (Sincronización)
+
+### 🟢 Al empezar tu sesión
+1. Entra en `backend`.
+2. Ejecuta: `npm.cmd run sync`
+3. Dile a tu AI: *"Lee `AI_CONTEXT.md` para ver los últimos cambios de mi compañero"*.
+
+### 🔴 Al terminar tu sesión
+1. En el terminal, guarda tus cambios:
+   - `git add .`
+   - `git commit -m "Explica qué has hecho"`
+2. Sube los cambios: `git push`
+3. **Importante**: Si has cambiado filtros o reglas, dile a tu AI: *"Actualiza `AI_CONTEXT.md`"* antes del push.
 
 ## 2. Instrucciones para la IA (Antigravity/ChatGPT)
 Para que el AI entienda el proyecto, debe leer estos archivos en este orden:
