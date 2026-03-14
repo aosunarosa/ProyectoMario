@@ -30,7 +30,7 @@ Automated Solana Scalper (V3.1).
 
 ## Collaboration Flow
 - **Git Repository**: Initialized at `/proyecto mario`.
-- **Secrets**: Managed in `backend/.env` (NOT tracked). Required keys: `HELIUS_API_KEY`, `SOLANA_PRIVATE_KEY`.
+- **Secrets**: Managed in `.env` (not tracked).
 - **Context Sync**: Use this file (`AI_CONTEXT.md`) and the artifacts in `.gemini/brain/`.
 
 ## Key Files
