@@ -21,7 +21,8 @@ Para que el AI entienda el proyecto, debe leer estos archivos en este orden:
 3. `SETUP_ANTIGRAVITY.md` (Este archivo): Para el flujo de trabajo.
 
 ## 3. Comandos Útiles para el AI
-- **Sincronizar**: `npm run sync` (Pull de Git).
+- **Sincronizar**: `npm run sync` (Pull de Git). 
+  - *Nota en Windows*: Si falla, usa `npm.cmd run sync`.
 - **Modo Desarrollo**: `npm run dev` (Backend).
 - **Auditar Seguridad**: "Revisa la concentración de holders en SolanaScalperService".
 
