@@ -109,22 +109,18 @@ export class PriceService {
     public static async getSolanaDetailedData(tokenAddress: string): Promise<{
         price: number;
         symbol: string;
-        // Price momentum
         change5m: number;
         change1h: number;
         change24h: number;
-        // Volume (multi-window)
         volumeM5: number;
-        volumeM15: number;   // derived from h1/4 approx
+        volumeM15: number;   
         volumeH1: number;
         volumeH24: number;
-        // Transaction counts (for buy pressure)
         buysM5: number;
+        buysH24: number;      
         sellsM5: number;
-        // Liquidity & safety
         liquidityUsd: number;
-        // Pair metadata
-        pairCreatedAt: number; // unix ms
+        pairCreatedAt: number; 
         fdv: number;
     } | null> {
         try {
@@ -132,7 +128,7 @@ export class PriceService {
             const pairs = response.data.pairs;
             if (!pairs || pairs.length === 0) return null;
 
-            const p = pairs.find((x: any) => x.chainId === 'solana') || pairs[0];
+            const p = pairs.find((x: any) => x.chainId === 'solana') || pairs.find((x: any) => x.chainId === 'base') || pairs[0];
 
             return {
                 price: parseFloat(p.priceUsd || '0'),
@@ -141,10 +137,11 @@ export class PriceService {
                 change1h: p.priceChange?.h1 || 0,
                 change24h: p.priceChange?.h24 || 0,
                 volumeM5: p.volume?.m5 || 0,
-                volumeM15: p.volume?.m15 || (p.volume?.h1 || 0) / 4, // approx if m15 missing
+                volumeM15: p.volume?.m15 || (p.volume?.h1 || 0) / 4,
                 volumeH1: p.volume?.h1 || 0,
                 volumeH24: p.volume?.h24 || 0,
                 buysM5: p.txns?.m5?.buys || 0,
+                buysH24: p.txns?.h24?.buys || 0,
                 sellsM5: p.txns?.m5?.sells || 0,
                 liquidityUsd: p.liquidity?.usd || 0,
                 pairCreatedAt: p.pairCreatedAt || 0,
@@ -152,6 +149,35 @@ export class PriceService {
             };
         } catch (error) {
             return null;
+        }
+    }
+
+    /**
+     * Estimates the cost of a swap in USDC.
+     * Base: ~200k gas * current gasPrice
+     * Solana: ~0.0005 SOL (Base + Aggressive Priority)
+     */
+    public static async getRealGasFee(chainId: 'base' | 'solana'): Promise<number> {
+        try {
+            if (chainId === 'base') {
+                const alchemyUrl = (process.env.ALCHEMY_BASE_WS_URL || '').replace('wss://', 'https://');
+                if (!alchemyUrl) return 0.15; 
+                
+                const res = await axios.post(alchemyUrl, {
+                    jsonrpc: '2.0', id: 1, method: 'eth_gasPrice', params: []
+                }, { timeout: 3000 });
+                
+                const weiPrice = parseInt(res.data?.result || '0', 16);
+                const ethPrice = 2500; 
+                const costEth = (200000 * weiPrice) / 1e18;
+                return Math.max(costEth * ethPrice, 0.005); 
+            } else {
+                const solPrice = 130; 
+                const costSol = 0.0005; 
+                return costSol * solPrice;
+            }
+        } catch {
+            return chainId === 'base' ? 0.15 : 0.01;
         }
     }
 }

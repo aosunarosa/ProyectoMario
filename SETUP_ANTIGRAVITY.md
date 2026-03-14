@@ -42,6 +42,22 @@ Para que el AI entienda el proyecto, debe leer estos archivos en este orden:
 
 ---
 
+## 🔐 PROMPT: CONFIGURACIÓN DE SECRETOS (.env)
+
+Tu compañero probablemente te pase sus claves por otro canal seguro. Cuando las tengas, pega esto:
+
+> "Antigravity, necesito que crees el archivo de configuración de secretos para el bot. 
+> 
+> Crea el archivo `.env` dentro de la carpeta `backend` con el siguiente contenido (rellena los huecos con mis claves):
+> 
+> PORT=3001
+> HELIUS_API_KEY=[PEGA_AQUI_LA_API_KEY_DE_HELIUS]
+> SOLANA_PRIVATE_KEY=[PEGA_AQUI_TU_PRIVATE_KEY_SECRETA]
+> 
+> Una vez creado, verifica que el archivo esté en el `.gitignore` para que nunca se suba a GitHub por error y confírmame que el bot ya puede leer las variables."
+
+---
+
 ## 🪄 THE MAGIC PROMPT (Copia y pega esto en Antigravity)
 
 > "Hola Antigravity. Estoy colaborando en un proyecto de Solana Scalper. Por favor, lee el archivo `AI_CONTEXT.md` en la raíz del proyecto y el archivo `SETUP_ANTIGRAVITY.md`. Una vez los leas, hazme un resumen de la arquitectura actual (V3.1) y confírmame que estás listo para ayudarme a programar mejoras siguiendo las reglas de seguridad establecidas."

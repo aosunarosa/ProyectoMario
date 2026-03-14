@@ -73,14 +73,17 @@ export class PortfolioService {
         }
     }
 
-    public closeTradeWithRealProfit(id: string, priceChangeRatio: number) {
+    public async closeTradeWithRealProfit(id: string, priceChangeRatio: number) {
         const trade = this.history.find(t => t.id === id);
         if (trade && trade.status === 'OPEN') {
+            const chain = trade.walletAddress === 'SOL_SCALPER' ? 'solana' : 'base';
+            const estimatedFee = await (require('./PriceService').PriceService.getRealGasFee(chain));
+            
             trade.amountOut = trade.amountIn * (1 + priceChangeRatio);
-            trade.profit = trade.amountOut - trade.amountIn;
+            trade.profit = (trade.amountOut - trade.amountIn) - estimatedFee; 
             trade.status = 'CLOSED';
-            this.balance += trade.amountOut; // Return capital + profit/loss to balance
-            console.log(`📈 [Portfolio] Closed ${trade.tokenSymbol || id} | ROI: ${(priceChangeRatio * 100).toFixed(4)}% | P/L: ${trade.profit >= 0 ? '+' : ''}${trade.profit.toFixed(4)} USDC`);
+            this.balance += (trade.amountOut - estimatedFee);
+            console.log(`📈 [Portfolio] Closed ${trade.tokenSymbol || id} | ROI: ${(priceChangeRatio * 100).toFixed(4)}% | P/L: ${trade.profit >= 0 ? '+' : ''}${trade.profit.toFixed(4)} USDC (inc. REAL-TIME fees)`);
         }
     }
 }

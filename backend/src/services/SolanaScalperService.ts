@@ -33,26 +33,44 @@ const SEED_TOKENS = [
 // ──────────────────────────────────────────────────────────────
 const CFG = {
     // Timing
-    SCAN_INTERVAL_MS: 5_000,
-    MONITOR_INTERVAL_MS: 3_000,
+    SCAN_INTERVAL_MS: 3_000,
+    MONITOR_INTERVAL_MS: 2_000,
 
     // Positions
-    MAX_PARALLEL: 3,
-    TOKENS_PER_CYCLE: 40,         // ↑ was 30, covers universe faster
-
+    MAX_PARALLEL: 5,               // ↑ increased for 150 universe
+    TOKENS_PER_CYCLE: 50,         // ↑ was 40
+ 
     // V3.1: Tuned for more opportunities
-    MIN_SCORE: 0.30,       // ↓ lowered from 0.35
+    MIN_SCORE: 0.28,       // ↓ slightly lowered for gems
 
     // Discovery — universe targets
     UNIVERSE_TARGET: 150,
-    DISCOVERY_QUERIES: ['sol', 'ai', 'meme', 'pump', 'pepe', 'doge', 'goat', 'fart', 'bonk', 'wif', 'popcat'],
-    DISCOVERY_MIN_VOL: 20_000,     // ↓ flood the universe with candidates
-    DISCOVERY_MIN_LIQ: 10_000,     // ↓ flood the universe with candidates
-    DISCOVERY_MAX_5M: 25.0,        // ↑ relaxed
+    DISCOVERY_QUERIES: ['sol', 'ai', 'meme', 'pump', 'new', 'launch', 'trending', 'gem', 'pepe', 'doge', 'goat', 'bonk', 'wif', 'popcat'],
+    DISCOVERY_MIN_VOL: 20_000,
+    DISCOVERY_MIN_LIQ: 10_000,
+    DISCOVERY_MAX_5M: 25.0,
 
-    // Rug / safety
+    // AI V3.5 Smart Entry Evolution
+    CONFIRMATION_MAX_DROP: 0.02,   // allowed pullback (2%)
+    ANTI_TOP_LIMIT: 0.025,        // Reject if >2.5% from spike
+    UNIVERSE_REFRESH_MS: 45_000, 
+
+    // ... (rest of old AI constants)
+    LEÑA_VOL_RATIO: 3.0,
+    LEÑA_MIN_VOL_1M: 5_000,
+    LEÑA_MIN_BUYS: 3,
+    LEÑA_BOOST: 0.15,
+ 
+    MIGRATION_BOOST: 0.20,
+    MIGRATION_WAIT_MS: 20_000,    // 20s window to confirm strength
+
+    RISK_MIN_LIQUIDITY: 30_000,    // floor for high-conviction plays
+    MAX_LIQ_FOR_BOOST: 5_000_000,  // don't apply leña/migration above $5M liq
+
+    // Standard safety
     MIN_LIQUIDITY_USD: 150_000,
-    MIN_VOLUME_24H_USD: 200_000,    // V3: raised from $100k
+    MIN_VOLUME_24H_USD: 200_000,
+    MIN_CHANGE_5M_MOMENTUM: 0.5,   // avoid flat markets
 
     // Anti-FOMO
     MAX_CHANGE_5M: 12.0,           // ↑ relaxed from 8.0%
@@ -96,11 +114,11 @@ const CFG = {
     // Jupiter slippage
     MAX_PRICE_IMPACT: 1.2,
 
-    // Exit
-    TAKE_PROFIT_TRAILING_ACTIVATE: 0.025,
-    TRAILING_DIST: 0.015,
-    STOP_LOSS: -0.02,
-    MAX_HOLD_MS: 120_000,
+    // Exit (V3.5 Refined Risk)
+    TAKE_PROFIT_TRAILING_ACTIVATE: 0.025, // 2.5%
+    TRAILING_DIST: 0.016,                // 1.6%
+    STOP_LOSS: -0.03,                   // -3.0%
+    MAX_HOLD_MS: 420_000,               // 7 minutes
 };
 
 // ──────────────────────────────────────────────────────────────
@@ -126,8 +144,22 @@ export class SolanaScalperService {
     private lastWinners: string[] = [];
     private cooldownMap: Map<string, number> = new Map();   // mint → last trade time
     private rejectionMap: Map<string, number> = new Map();  // mint → last reject time
+    private discoveryTimeMap: Map<string, number> = new Map(); // mint → first discovered time
 
     private discoveryRotationIndex = 0;
+
+    /** Cycle snapshots for 1m delta calculation */
+    private cycleHistory: Map<string, { volume: number; buys: number; timestamp: number }[]> = new Map();
+    /** Pump.fun migration confirmation queue */
+    private potentialMigrations: Map<string, { detectedAt: number }> = new Map();
+    /** V3.5 Smart Entry confirmation queue */
+    private potentialEntries: Map<string, { 
+        detectedAt: number; 
+        detectedPrice: number; 
+        initialScore: number;
+        peakPrice: number;
+        symbol: string 
+    }> = new Map();
 
     /** Live token universe, refreshed each cycle */
     private tokenUniverse: TokenEntry[] = [...SEED_TOKENS];
@@ -161,7 +193,7 @@ export class SolanaScalperService {
      */
     private async refreshUniverse() {
         const now = Date.now();
-        if (now - this.lastUniverseRefresh < 60_000) return; // max once per minute
+        if (now - this.lastUniverseRefresh < CFG.UNIVERSE_REFRESH_MS) return; 
         this.lastUniverseRefresh = now;
 
         const engine = getTradingEngine();
@@ -212,6 +244,7 @@ export class SolanaScalperService {
                         if (mint && symbol && !seen.has(mint)) {
                             seen.add(mint);
                             discovered.push({ mint, symbol });
+                            this.discoveryTimeMap.set(mint, Date.now());
                         }
                     });
                 } catch { /* ignore individual query failures */ }
@@ -316,6 +349,25 @@ export class SolanaScalperService {
             await this.refreshUniverse();
         }
 
+        // ── V3.3: Universe Expiry Logic (15 min) ─────────────
+        const nowExpiry = Date.now();
+        const EXPIRY_MS = 15 * 60 * 1000;
+        const initialCount = this.tokenUniverse.length;
+        
+        this.tokenUniverse = this.tokenUniverse.filter(t => {
+            // Keep SEED tokens forever
+            if (SEED_TOKENS.some(st => st.mint === t.mint)) return true;
+            // Keep active positions
+            if (this.activePositions.has(t.mint)) return true;
+            
+            const discoveredAt = this.discoveryTimeMap.get(t.mint) || 0;
+            return (nowExpiry - discoveredAt) < EXPIRY_MS;
+        });
+
+        if (this.tokenUniverse.length < initialCount) {
+            engine.emitLog(`♻️ [V3.3] Cleanup: Expired ${initialCount - this.tokenUniverse.length} stale tokens from universe.`, 'info');
+        }
+
         // Sample from universe, skipping recently rejected tokens
         const now2 = Date.now();
         const eligible = this.tokenUniverse.filter(t => {
@@ -343,6 +395,13 @@ export class SolanaScalperService {
         const results = await Promise.all(
             batch.map(async t => {
                 const data = await PriceService.getSolanaDetailedData(t.mint);
+                if (data) {
+                    // Update cycle history for 1m calculations (Volume + Buys)
+                    let hist = this.cycleHistory.get(t.mint) || [];
+                    hist.push({ volume: data.volumeH24, buys: data.buysH24, timestamp: Date.now() });
+                    if (hist.length > 20) hist.shift(); // keep last ~3 mins of snapshots
+                    this.cycleHistory.set(t.mint, hist);
+                }
                 return data ? { mint: t.mint, symbol: t.symbol, data } : null;
             })
         );
@@ -376,26 +435,69 @@ export class SolanaScalperService {
             .filter(t => {
                 const scorePass = t.score >= CFG.MIN_SCORE;
                 const posPass = !this.activePositions.has(t.mint);
-                const lastTraded = this.cooldownMap.get(t.mint) || 0;
-                const cooldownPass = (now - lastTraded) >= CFG.TOKEN_COOLDOWN_MS;
+                const lastTraded = this.cooldownMap.set(t.mint, Date.now()); // check against rejection map too normally
+                const rejectedAt = this.rejectionMap.get(t.mint) || 0;
+                const cooldownPass = (now - rejectedAt) >= CFG.TOKEN_REJECTION_COOLDOWN_MS;
 
                 return scorePass && posPass && cooldownPass;
-            })
-            .slice(0, CFG.MAX_PARALLEL);
+            });
 
-        if (candidates.length === 0) {
-            engine.emitLog(`⏸️ [V3] No token reached min score ${CFG.MIN_SCORE}. Cycle done.`, 'warning');
-            return;
+        // ── V3.5: ADAPTIVE SMART ENTRY CONFIRMATION ────────────────────
+        for (const c of candidates) {
+            if (!this.potentialEntries.has(c.mint)) {
+                this.potentialEntries.set(c.mint, { 
+                    detectedAt: now, 
+                    detectedPrice: c.data.price,
+                    initialScore: c.score,
+                    peakPrice: c.data.price,
+                    symbol: c.symbol 
+                });
+                const window = c.score >= 0.42 ? 20 : (c.score >= 0.34 ? 30 : 45);
+                engine.emitLog(`⏳ [V3.5] POTENTIAL: ${c.symbol} (Score: ${c.score.toFixed(2)}). Adaptive Wait: ${window}s...`, 'info');
+            } else {
+                // Track peak during confirmation for efficiency metric
+                const entry = this.potentialEntries.get(c.mint)!;
+                if (c.data.price > entry.peakPrice) entry.peakPrice = c.data.price;
+            }
         }
 
-        this.lastWinners = candidates.map(c => c.mint);
+        const confirmed: ScoredToken[] = [];
+        for (const [mint, entry] of this.potentialEntries) {
+            const elapsed = now - entry.detectedAt;
+            const requiredWait = entry.initialScore >= 0.42 ? 20_000 : (entry.initialScore >= 0.34 ? 30_000 : 45_000);
+
+            if (elapsed >= requiredWait) {
+                const scout = scored.find(s => s.mint === mint);
+                if (scout) {
+                    const priceDrop = (entry.detectedPrice - scout.data.price) / entry.detectedPrice;
+                    const priceMove = (scout.data.price - entry.detectedPrice) / entry.detectedPrice;
+                    
+                    if (priceMove > CFG.ANTI_TOP_LIMIT) {
+                        engine.emitLog(`🚫 [V3.5] ANTI-TOP: ${scout.symbol} moved +${(priceMove*100).toFixed(1)}% (Limit: 2.5%). Too late.`, 'warning');
+                        this.rejectionMap.set(mint, now);
+                    } else if (priceDrop < CFG.CONFIRMATION_MAX_DROP) {
+                        confirmed.push(scout);
+                        const efficiency = (scout.data.price - entry.detectedPrice) / Math.max(entry.peakPrice - entry.detectedPrice, 0.000001);
+                        engine.emitLog(`✅ [V3.5] CONFIRMED: ${scout.symbol} | Wait: ${requiredWait/1000}s | Entry Efficiency: ${(1-efficiency).toFixed(2)}`, 'success');
+                    } else {
+                        engine.emitLog(`🚫 [V3.5] REJECTED: ${scout.symbol} failed confirmation (dropped ${(priceDrop * 100).toFixed(1)}%).`, 'warning');
+                        this.rejectionMap.set(mint, now);
+                    }
+                }
+                this.potentialEntries.delete(mint);
+            }
+        }
+
+        if (confirmed.length === 0) return;
+
+        this.lastWinners = confirmed.map(c => c.mint).slice(0, CFG.MAX_PARALLEL);
         engine.emitLog(
-            `🎯 [V3] Opening ${candidates.length} trade(s): ${candidates.map(c => `${c.symbol}(${c.score.toFixed(2)})`).join(', ')}`,
+            `🎯 [V3] Opening ${confirmed.length} trade(s): ${confirmed.map(c => `${c.symbol}`).join(', ')}`,
             'success'
         );
 
         const solPerTrade = totalSol / CFG.MAX_PARALLEL;
-        candidates.forEach(c => this.openPosition(c, solPerTrade));
+        confirmed.slice(0, CFG.MAX_PARALLEL).forEach(c => this.openPosition(c, solPerTrade));
     }
 
     // ── Scoring engine V3 ─────────────────────────────────────
@@ -403,10 +505,66 @@ export class SolanaScalperService {
         const engine = getTradingEngine();
         const bd: Record<string, number> = {};
 
-        // ── HARD FILTERS — stamp rejectionMap on every hard reject ──
-        if (d.liquidityUsd < CFG.MIN_LIQUIDITY_USD) {
-            this.rejectionMap.set(mint, Date.now());
+        // ── AI V3.2 REFINED: 1m VOLUME SPIKE (LEÑA) ──────────────────
+        let leñaActive = false;
+        const history = this.cycleHistory.get(mint) || [];
+        const now = Date.now();
+        const oneMinAgo = now - 60_000;
+        const meetsLiqCap = d.liquidityUsd <= CFG.MAX_LIQ_FOR_BOOST;
+        
+        const oldSnap = history.find(h => h.timestamp <= oneMinAgo) || (history.length > 0 ? history[0] : null);
+        
+        if (oldSnap && meetsLiqCap) {
+            const deltaVol = d.volumeH24 - oldSnap.volume;
+            const deltaBuys = d.buysH24 - oldSnap.buys;
+            const avgVol1m = d.volumeM5 / 5;
+            
+            const isRatioSpike = deltaVol / Math.max(avgVol1m, 1) > CFG.LEÑA_VOL_RATIO;
+            const isHardVolSpike = deltaVol >= CFG.LEÑA_MIN_VOL_1M;
+            const isBuySpike = deltaBuys >= CFG.LEÑA_MIN_BUYS;
+
+            if (isRatioSpike && isHardVolSpike && isBuySpike) {
+                leñaActive = true;
+                bd.leñaSpike = CFG.LEÑA_BOOST;
+                engine.emitLog(`🔥 [LEÑA] Precision Spike: ${symbol} +$${(deltaVol/1000).toFixed(1)}K | ${deltaBuys} buys in 60s`, 'success');
+            }
+        }
+
+        // ── AI V3.2: PUMP.FUN MIGRATION (WAIT & VERIFY) ──────
+        let migrationConfirmed = false;
+        const isPumpFunMint = mint.endsWith('pump');
+        const isNewRaydium = (Date.now() - d.pairCreatedAt) < 300_000;
+
+        if (isPumpFunMint && isNewRaydium && meetsLiqCap) {
+            if (!this.potentialMigrations.has(mint)) {
+                this.potentialMigrations.set(mint, { detectedAt: Date.now() });
+                engine.emitLog(`🛸 [MIGRATION] Potential detected for ${symbol}. Waiting 20s for confirmation...`, 'info');
+            } else {
+                const mig = this.potentialMigrations.get(mint)!;
+                const elapsed = Date.now() - mig.detectedAt;
+                if (elapsed >= CFG.MIGRATION_WAIT_MS) {
+                    const buyPressure = d.buysM5 / Math.max(d.buysM5 + d.sellsM5, 1);
+                    if (buyPressure > 0.55 && d.change5m > 0) {
+                        migrationConfirmed = true;
+                        bd.migrationBoost = CFG.MIGRATION_BOOST;
+                        engine.emitLog(`✅ [MIGRATION] Strategy Confirmed for ${symbol}! (Wait window passed + Strength verified)`, 'success');
+                    }
+                }
+            }
+        }
+
+        // ── UPDATED LIQUIDITY FLOOR (RISK BRANCH) ────────────
+        const hasHighConviction = leñaActive || migrationConfirmed;
+        const minLiq = hasHighConviction ? CFG.RISK_MIN_LIQUIDITY : CFG.MIN_LIQUIDITY_USD;
+
+        if (d.liquidityUsd < minLiq) {
+            if (!hasHighConviction) this.rejectionMap.set(mint, Date.now());
             return null;
+        }
+
+        // ── HARD FILTERS ──
+        if (d.change5m < CFG.MIN_CHANGE_5M_MOMENTUM) {
+            return null; // avoid flat market noise
         }
         if (d.volumeH24 < CFG.MIN_VOLUME_24H_USD) {
             this.rejectionMap.set(mint, Date.now());
@@ -487,6 +645,10 @@ export class SolanaScalperService {
             engine.emitLog(`🐋 [V3] ${symbol} WHALE DETECTED: avg buy $${(avgBuySize / 1000).toFixed(0)}K → +${CFG.WHALE_BOOST}`, 'success');
         }
 
+        // Apply new boosts to final score
+        if (bd.leñaSpike) score += bd.leñaSpike;
+        if (bd.migrationBoost) score += bd.migrationBoost;
+
         return { mint, symbol, data: d, score, breakdown: bd };
     }
 
@@ -561,7 +723,7 @@ export class SolanaScalperService {
             if (exitReason) {
                 clearInterval(monitor);
                 this.activePositions.delete(token.mint);
-                (portfolio as any).closeTradeWithRealProfit(tradeId, changeFromEntry);
+                await (portfolio as any).closeTradeWithRealProfit(tradeId, changeFromEntry);
 
                 engine.emitLog(
                     `${exitReason} | SELL ${token.symbol} @ $${currentPrice.toFixed(6)} | ${changeFromEntry >= 0 ? '+' : ''}${(changeFromEntry * 100).toFixed(4)}% | ${changeFromEntry >= 0 ? '+' : ''}${(tradeSol * changeFromEntry).toFixed(5)} SOL`,

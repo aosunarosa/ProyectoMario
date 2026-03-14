@@ -1,163 +1,295 @@
 import { PriceService } from './PriceService';
 import { getTradingEngine } from './EngineInstance';
 import { getPortfolioService } from './PortfolioService';
+import axios from 'axios';
 
-// Real tokens on Base network to monitor
-const MONITORED_TOKENS = [
-    { address: '0x4200000000000000000000000000000000000006', symbol: 'WETH' },
-    { address: '0x50c5725949a65193f2c9ef3017fa72551469e71d', symbol: 'BRETT' },
-    { address: '0x0d97f39386c990264b38dcd26d03f0b24059a4c8', symbol: 'DEGEN' },
-    { address: '0x7b561c2105ccf10f44e8bc1982b6049298e8338f', symbol: 'TOSHI' },
-    { address: '0x940181a94a35a4569e4529a3cdfb74e38fd98631', symbol: 'AERO' },
-];
+// ──────────────────────────────────────────────────────────────
+// CONFIG V3.3 (BASE NETWORK)
+// ──────────────────────────────────────────────────────────────
+const CFG = {
+    SCAN_INTERVAL_MS: 3_000,
+    MONITOR_INTERVAL_MS: 2_000,
+    MAX_PARALLEL: 5,
+    TOKENS_PER_CYCLE: 40,
+    UNIVERSE_TARGET: 150,
 
-// Exit thresholds — HIGH RISK / HIGH REWARD MODE 🔥
-const TAKE_PROFIT = 0.03;    // +3.0% = exit with profit
-const STOP_LOSS = -0.015;  // -1.5% = cut losses
-const MAX_HOLD_MS = 180000;  // 3 minutes max hold
-const CHECK_EVERY = 5000;    // Check price every 5 seconds
-const MAX_PARALLEL = 3;      // Max simultaneous positions
+    MIN_SCORE: 0.28,
+    DISCOVERY_QUERIES: ['base', 'ai', 'meme', 'degen', 'new', 'launch', 'trending', 'gem', 'blue', 'farcaster', 'moon', 'rocket', 'ape'],
+    DISCOVERY_MIN_VOL: 5_000,     // ↓ lower for discovery universe
+    DISCOVERY_MIN_LIQ: 10_000,    // ↓ lower for discovery universe
+    DISCOVERY_MAX_5M: 25.0,
+
+    // AI V3.3 Gem Guard
+    MAX_LIQ_FOR_BOOST: 5_000_000,
+    MIN_CHANGE_5M_MOMENTUM: 0.5,
+
+    // Safety (Trade Entry Filters)
+    MIN_LIQUIDITY_USD: 50_000,    // ↓ lowered per user request
+    MIN_VOLUME_24H_USD: 20_000,   // ↓ lowered per user request
+    MAX_CHANGE_5M: 15.0,
+
+    // Scoring weights (Unified)
+    W_MOMENTUM5M: 0.35,
+    W_VOL_SPIKE: 0.25,
+    W_BUY_PRESSURE: 0.25,
+    W_LIQUIDITY: 0.15,
+
+    // AI V3.5 Smart Entry Evolution
+    CONFIRMATION_MAX_DROP: 0.02, 
+    ANTI_TOP_LIMIT: 0.025,
+    UNIVERSE_REFRESH_MS: 45_000,
+
+    // Exit (V3.5 Refined Risk)
+    TAKE_PROFIT_TRAILING_ACTIVATE: 0.025,
+    TRAILING_DIST: 0.016,
+    STOP_LOSS: -0.03,
+    MAX_HOLD_MS: 420_000,        // 7 minutes
+};
+
+interface TokenEntry { address: string; symbol: string; }
+interface ScoredToken {
+    address: string;
+    symbol: string;
+    data: any;
+    score: number;
+    breakdown: Record<string, number>;
+}
 
 export class ScalperService {
     private isRunning = false;
-    private scalperInterval: NodeJS.Timeout | null = null;
+    private cycleInterval: NodeJS.Timeout | null = null;
     private activePositions: Set<string> = new Set();
+    private cooldownMap: Map<string, number> = new Map();
+    private discoveryTimeMap: Map<string, number> = new Map();
+    private potentialEntries: Map<string, { 
+        detectedAt: number; 
+        detectedPrice: number; 
+        initialScore: number;
+        peakPrice: number;
+        symbol: string 
+    }> = new Map();
+    private tokenUniverse: TokenEntry[] = [];
+    private lastUniverseRefresh = 0;
+    private lastWinners: string[] = [];
 
     public async startScalper(balance: number) {
         if (this.isRunning) return;
         this.isRunning = true;
-
         const engine = getTradingEngine();
-        engine.emitLog(
-            `🚀 [Scalper IA] Starting. Max ${MAX_PARALLEL} parallel positions | TP: +${TAKE_PROFIT * 100}% | SL: ${STOP_LOSS * 100}%`,
-            'success'
-        );
-
-        this.scalperInterval = setInterval(() => {
-            this.runRealDataCycle(balance);
-        }, 30000);
-
-        this.runRealDataCycle(balance);
+        engine.emitLog(`🚀 [BASE V3.3] Gem Hunter active | 3s Cycle | MinScore: ${CFG.MIN_SCORE} | Hold: 7m`, 'success');
+        this.cycleInterval = setInterval(() => this.runCycle(balance), CFG.SCAN_INTERVAL_MS);
+        this.runCycle(balance);
     }
 
     public stopScalper() {
-        if (this.scalperInterval) clearInterval(this.scalperInterval);
+        if (this.cycleInterval) clearInterval(this.cycleInterval);
         this.isRunning = false;
         this.activePositions.clear();
-        const engine = getTradingEngine();
-        engine.emitLog(`🛑 [Scalper IA] System shutdown. All positions closed.`, 'warning');
+        getTradingEngine().emitLog('🛑 [BASE V3] Shutdown.', 'warning');
     }
 
-    private async runRealDataCycle(totalBalance: number) {
-        if (!this.isRunning) return;
+    private async refreshUniverse() {
+        const now = Date.now();
+        if (now - this.lastUniverseRefresh < CFG.UNIVERSE_REFRESH_MS) return;
+        this.lastUniverseRefresh = now;
 
         const engine = getTradingEngine();
+        const seen = new Set<string>(this.tokenUniverse.map(t => t.address));
+        const discovered: TokenEntry[] = [];
 
-        engine.emitLog(`🧠 [Scalper IA] Scanning all tokens for momentum...`, 'info');
+        const letters = 'abcdefghijklmnopqrstuvwxyz';
+        const queries = [...CFG.DISCOVERY_QUERIES];
+        for (let i = 0; i < 5; i++) {
+            queries.push(letters[Math.floor(Math.random() * letters.length)] + letters[Math.floor(Math.random() * letters.length)]);
+        }
 
-        // 1. Fetch REAL momentum from DexScreener for all tokens in parallel
-        const momentumData = await Promise.all(
-            MONITORED_TOKENS.map(async (t) => {
-                const data = await PriceService.getTokenMomentum(t.address);
-                return data ? { ...t, ...data } : null;
+        await Promise.all(
+            queries.slice(-8).map(async (query) => {
+                try {
+                    const res = await axios.get(`https://api.dexscreener.com/latest/dex/search?q=${encodeURIComponent(query)}`, { timeout: 5000 });
+                    const pairs = res.data?.pairs || [];
+                    pairs.forEach((p: any) => {
+                        if (p.chainId !== 'base') return;
+                        const vol = parseFloat(p.volume?.h24 || '0');
+                        const liq = parseFloat(p.liquidity?.usd || '0');
+                        if (vol < CFG.DISCOVERY_MIN_VOL || liq < CFG.DISCOVERY_MIN_LIQ) return;
+
+                        const address = p.baseToken?.address;
+                        const symbol = p.baseToken?.symbol;
+                        if (address && symbol && !seen.has(address)) {
+                            seen.add(address);
+                            discovered.push({ address, symbol });
+                            this.discoveryTimeMap.set(address, Date.now());
+                        }
+                    });
+                } catch { }
             })
         );
 
-        const validData = momentumData.filter(Boolean) as Array<{
-            address: string; symbol: string; price: number;
-            change5m: number; change1h: number; volume24h: number;
-        }>;
-
-        if (validData.length === 0) {
-            engine.emitLog(`⚠️ [Scalper IA] API unavailable. Skipping cycle.`, 'warning');
-            return;
-        }
-
-        // 2. Score and log all tokens
-        const scored = validData.map(t => ({
-            ...t,
-            score: t.change5m * 0.7 + t.change1h * 0.3
-        })).sort((a, b) => b.score - a.score);
-
-        scored.forEach(t => {
-            engine.emitLog(
-                `📊 ${t.symbol}: $${t.price.toFixed(6)} | 5m: ${t.change5m >= 0 ? '+' : ''}${t.change5m.toFixed(2)}% | Score: ${t.score.toFixed(2)}`,
-                'info'
-            );
-        });
-
-        // 3. Get top N candidates with positive momentum, not already in position
-        const candidates = scored
-            .filter(t => t.score > 0 && !this.activePositions.has(t.address))
-            .slice(0, MAX_PARALLEL);
-
-        if (candidates.length === 0) {
-            engine.emitLog(`⏸️ [Scalper IA] No viable candidates. Holding cash.`, 'warning');
-            return;
-        }
-
-        engine.emitLog(`🎯 [Scalper IA] Opening ${candidates.length} parallel positions: ${candidates.map(c => c.symbol).join(', ')}`, 'success');
-
-        // 4. Open ALL viable positions simultaneously
-        const allocationPerTrade = (totalBalance / MAX_PARALLEL);
-        candidates.forEach(winner => this.openPosition(winner, allocationPerTrade));
+        this.tokenUniverse = [...this.tokenUniverse, ...discovered].slice(0, CFG.UNIVERSE_TARGET);
+        engine.emitLog(`🌐 [BASE Discovery] Universe: ${this.tokenUniverse.length} tokens`, 'info');
     }
 
-    private openPosition(winner: { address: string; symbol: string; price: number; score: number }, allocation: number) {
+    private async runCycle(totalBalance: number) {
+        if (!this.isRunning) return;
         const engine = getTradingEngine();
+        await this.refreshUniverse();
+
+        // Universe Expiry (15 min)
+        const EXPIRY_MS = 15 * 60 * 1000;
+        const now = Date.now();
+        this.tokenUniverse = this.tokenUniverse.filter(t => {
+            if (this.activePositions.has(t.address)) return true;
+            const discoveredAt = this.discoveryTimeMap.get(t.address) || 0;
+            return (now - discoveredAt) < EXPIRY_MS;
+        });
+
+        if (this.tokenUniverse.length === 0) return;
+
+        const shuffled = [...this.tokenUniverse].sort(() => Math.random() - 0.5);
+        const batch = shuffled.slice(0, CFG.TOKENS_PER_CYCLE);
+
+        engine.emitLog(`🧠 [BASE V3] Scan: ${batch.length} tokens | ${this.activePositions.size} open`, 'info');
+
+        const results = await Promise.all(batch.map(async t => {
+            const data = await PriceService.getSolanaDetailedData(t.address); // Cross-chain helper
+            return data ? { ...t, data } : null;
+        }));
+
+        const valid = results.filter(Boolean) as any[];
+        const scored: ScoredToken[] = [];
+        for (const token of valid) {
+            const res = this.scoreToken(token.address, token.symbol, token.data);
+            if (res) scored.push(res);
+        }
+
+        scored.sort((a, b) => b.score - a.score);
+        const candidates = scored.filter(t => t.score >= CFG.MIN_SCORE && !this.activePositions.has(t.address));
+
+        // ── V3.5: ADAPTIVE SMART ENTRY CONFIRMATION ────────────────────
+        for (const c of candidates) {
+            if (!this.potentialEntries.has(c.address)) {
+                this.potentialEntries.set(c.address, { 
+                    detectedAt: now, 
+                    detectedPrice: c.data.price,
+                    initialScore: c.score,
+                    peakPrice: c.data.price,
+                    symbol: c.symbol 
+                });
+                const window = c.score >= 0.42 ? 20 : (c.score >= 0.34 ? 30 : 45);
+                engine.emitLog(`⏳ [BASE V3.5] POTENTIAL: ${c.symbol} (Score: ${c.score.toFixed(2)}). Wait: ${window}s...`, 'info');
+            } else {
+                const entry = this.potentialEntries.get(c.address)!;
+                if (c.data.price > entry.peakPrice) entry.peakPrice = c.data.price;
+            }
+        }
+
+        const confirmed: ScoredToken[] = [];
+        for (const [address, entry] of this.potentialEntries) {
+            const elapsed = now - entry.detectedAt;
+            const requiredWait = entry.initialScore >= 0.42 ? 20_000 : (entry.initialScore >= 0.34 ? 30_000 : 45_000);
+
+            if (elapsed >= requiredWait) {
+                const scout = scored.find(s => s.address === address);
+                if (scout) {
+                    const priceDrop = (entry.detectedPrice - scout.data.price) / entry.detectedPrice;
+                    const priceMove = (scout.data.price - entry.detectedPrice) / entry.detectedPrice;
+
+                    if (priceMove > CFG.ANTI_TOP_LIMIT) {
+                        engine.emitLog(`🚫 [BASE V3.5] ANTI-TOP: ${scout.symbol} moved +${(priceMove*100).toFixed(1)}%. Chasing top, skip.`, 'warning');
+                        this.cooldownMap.set(address, now);
+                    } else if (priceDrop < CFG.CONFIRMATION_MAX_DROP) {
+                        confirmed.push(scout);
+                        const efficiency = (scout.data.price - entry.detectedPrice) / Math.max(entry.peakPrice - entry.detectedPrice, 0.000001);
+                        engine.emitLog(`✅ [BASE V3.5] CONFIRMED: ${scout.symbol} | Wait: ${requiredWait/1000}s | Eff: ${(1-efficiency).toFixed(2)}`, 'success');
+                    } else {
+                        engine.emitLog(`🚫 [BASE V3.5] REJECTED: ${scout.symbol} pulled back too much.`, 'warning');
+                        this.cooldownMap.set(address, now);
+                    }
+                }
+                this.potentialEntries.delete(address);
+            }
+        }
+
+        if (confirmed.length > 0) {
+            engine.emitLog(`🎯 [BASE V3] Picking ${confirmed.length} confirmed gems.`, 'success');
+            const allocation = Math.min(10.0, totalBalance / CFG.MAX_PARALLEL);
+            confirmed.slice(0, CFG.MAX_PARALLEL).forEach(c => this.openPosition(c, allocation));
+        }
+    }
+
+    private scoreToken(address: string, symbol: string, d: any): ScoredToken | null {
+        if (d.change5m < CFG.MIN_CHANGE_5M_MOMENTUM) return null;
+        if (d.liquidityUsd < CFG.MIN_LIQUIDITY_USD || d.volumeH24 < CFG.MIN_VOLUME_24H_USD) return null;
+        if (d.change5m > CFG.MAX_CHANGE_5M) return null;
+
+        const bd: Record<string, number> = {};
+        const meetsLiqCap = d.liquidityUsd <= CFG.MAX_LIQ_FOR_BOOST;
+
+        bd.momentum = Math.min(Math.max(d.change5m / 5, 0), 1);
+        bd.volSpike = Math.min(d.volumeM5 / (d.volumeH1 / 12 || 1) / 2.5, 1);
+        bd.buyPressure = d.buysM5 / Math.max(d.buysM5 + d.sellsM5, 1);
+        bd.liquidity = Math.min(Math.log10(d.liquidityUsd / 100_000 + 1) / 2, 1);
+
+        let score = (bd.momentum * CFG.W_MOMENTUM5M) + (bd.volSpike * CFG.W_VOL_SPIKE) + (bd.buyPressure * CFG.W_BUY_PRESSURE) + (bd.liquidity * CFG.W_LIQUIDITY);
+
+        if (meetsLiqCap && bd.volSpike > 0.6) {
+            score += 0.15; // Gem boost
+            bd.gemBoost = 0.15;
+            getTradingEngine().emitLog(`💎 [GEMA] High Accel on ${symbol} (Liq: $${(d.liquidityUsd/1000).toFixed(0)}k)`, 'success');
+        }
+
+        return { address, symbol, data: d, score, breakdown: bd };
+    }
+
+    private async openPosition(token: ScoredToken, usdcAllocation: number) {
         const portfolio = getPortfolioService();
+        const tradeId = portfolio.registerTrade('BASE_SCALPER', usdcAllocation, token.address, token.symbol);
+        if (!tradeId) return;
 
-        const conviction = Math.min(Math.max(winner.score / 3, 0.2), 0.7);
-        const scalpAmount = allocation * conviction;
-        const entryPrice = winner.price;
-
-        engine.emitLog(
-            `⚡ BUY ${winner.symbol} @ $${entryPrice.toFixed(6)} | Amount: ${scalpAmount.toFixed(2)} USDC`,
-            'success'
-        );
-
-        const tradeId = portfolio.registerTrade('SCALPER_BOT', scalpAmount, winner.address, winner.symbol);
-        this.activePositions.add(winner.address);
-
-        // Dynamic exit monitor — checks every 5s
+        this.activePositions.add(token.address);
+        const engine = getTradingEngine();
+        const entryPrice = token.data.price;
         const startTime = Date.now();
+        let peakPrice = entryPrice;
+        let trailingActive = false;
 
         const monitor = setInterval(async () => {
-            if (!this.isRunning) {
-                clearInterval(monitor);
-                return;
-            }
+            const data = await PriceService.getSolanaDetailedData(token.address);
+            if (!data) return;
 
-            const currentData = await PriceService.getTokenMomentum(winner.address);
-            if (!currentData) return;
-
-            const currentPrice = currentData.price;
-            const changeFromEntry = (currentPrice - entryPrice) / entryPrice;
+            const currentPrice = data.price;
+            const change = (currentPrice - entryPrice) / entryPrice;
             const elapsed = Date.now() - startTime;
 
-            let exitReason: string | null = null;
+            if (currentPrice > peakPrice) peakPrice = currentPrice;
+            const peakChange = (peakPrice - entryPrice) / entryPrice;
 
-            if (changeFromEntry >= TAKE_PROFIT) {
-                exitReason = `✅ TAKE PROFIT`;
-            } else if (changeFromEntry <= STOP_LOSS) {
+            if (peakChange >= CFG.TAKE_PROFIT_TRAILING_ACTIVATE) {
+                trailingActive = true;
+                engine.emitLog(`📈 [BASE V3] ${token.symbol} trailing ACTIVATED (peak +${(peakChange * 100).toFixed(2)}%)`, 'info');
+            }
+
+            const trailingFloor = trailingActive
+                ? (peakPrice * (1 - CFG.TRAILING_DIST) - entryPrice) / entryPrice
+                : -Infinity;
+
+            let exitReason: string | null = null;
+            if (trailingActive && change <= trailingFloor) {
+                exitReason = `📉 TRAIL STOP (peak +${(peakChange * 100).toFixed(2)}%)`;
+            } else if (change <= CFG.STOP_LOSS) {
                 exitReason = `🛑 STOP LOSS`;
-            } else if (elapsed >= MAX_HOLD_MS) {
-                exitReason = `⏲️ TIMEOUT (${Math.round(elapsed / 1000)}s)`;
+            } else if (elapsed >= CFG.MAX_HOLD_MS) {
+                exitReason = `⏲️ TIMEOUT`;
             }
 
             if (exitReason) {
                 clearInterval(monitor);
-                this.activePositions.delete(winner.address);
-
-                (portfolio as any).closeTradeWithRealProfit(tradeId, changeFromEntry);
-
-                const pnlUsdc = (scalpAmount * changeFromEntry).toFixed(4);
-                engine.emitLog(
-                    `${exitReason} | SELL ${winner.symbol} @ $${currentPrice.toFixed(6)} | P/L: ${changeFromEntry >= 0 ? '+' : ''}${(changeFromEntry * 100).toFixed(4)}% (${changeFromEntry >= 0 ? '+' : ''}${pnlUsdc} USDC)`,
-                    changeFromEntry > 0 ? 'success' : 'warning'
-                );
+                this.activePositions.delete(token.address);
+                await (portfolio as any).closeTradeWithRealProfit(tradeId, change);
+                engine.emitLog(`${exitReason} | ${token.symbol} @ P/L: ${(change * 100).toFixed(2)}%`, change > 0 ? 'success' : 'warning');
             }
-        }, CHECK_EVERY);
+        }, 5000);
     }
 }
 
